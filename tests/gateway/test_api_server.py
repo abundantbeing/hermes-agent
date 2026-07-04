@@ -616,6 +616,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
 
@@ -662,6 +664,170 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+    @pytest.mark.asyncio
+    async def test_session_chat_resolves_requested_model_route(self, adapter, monkeypatch):
+        route = {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "context_length": "200000",
+        }
+        captured = {}
+
+        class FakeRequest:
+            match_info = {"session_id": "session-123"}
+            headers = {}
+
+            async def json(self):
+                return {
+                    "message": "hello",
+                    "model": "browser-selected-model",
+                    "system_message": "browser system prompt",
+                }
+
+        async def fake_run_agent(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "ok", "session_id": "session-123"}, {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+            }
+
+        monkeypatch.setattr(adapter, "_get_existing_session_or_404", lambda session_id: ({"id": session_id}, None))
+        monkeypatch.setattr(adapter, "_conversation_history_for_session", lambda session_id: [])
+        monkeypatch.setattr(adapter, "_resolve_route", lambda model: route if model == "browser-selected-model" else None)
+        monkeypatch.setattr(adapter, "_run_agent", fake_run_agent)
+
+        response = await adapter._handle_session_chat(FakeRequest())
+        payload = json.loads(response.text)
+
+        assert captured["route"] == route
+        assert payload["runtime"] == {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "context_length": 200000,
+        }
+
+    @pytest.mark.asyncio
+    async def test_session_chat_builds_route_from_raw_browser_provider(self, adapter, monkeypatch):
+        captured = {}
+
+        class FakeRequest:
+            match_info = {"session_id": "session-123"}
+            headers = {}
+
+            async def json(self):
+                return {
+                    "message": "hello",
+                    "model": "anthropic/claude-sonnet-4",
+                    "provider": "openrouter",
+                    "model_options": {
+                        "reasoning": {"enabled": True, "effort": "xhigh"},
+                        "service_tier": "priority",
+                    },
+                }
+
+        async def fake_run_agent(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "ok", "session_id": "session-123"}, {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+            }
+
+        monkeypatch.setattr(adapter, "_get_existing_session_or_404", lambda session_id: ({"id": session_id}, None))
+        monkeypatch.setattr(adapter, "_conversation_history_for_session", lambda session_id: [])
+        monkeypatch.setattr(adapter, "_resolve_route", lambda model: None)
+        monkeypatch.setattr(adapter, "_run_agent", fake_run_agent)
+
+        response = await adapter._handle_session_chat(FakeRequest())
+        payload = json.loads(response.text)
+
+        assert captured["route"] == {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+        }
+        assert captured["runtime_options"] == {
+            "reasoning_config": {"enabled": True, "effort": "xhigh"},
+            "service_tier": "priority",
+        }
+        assert payload["runtime"] == {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "context_length": None,
+        }
+
+    def test_session_chat_stream_resolves_requested_model_route(self):
+        source_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "gateway", "platforms", "api_server.py")
+        )
+        with open(source_path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        stream_start = source.index("async def _handle_session_chat_stream")
+        stream_end = source.index("async def _handle_chat_completions")
+        stream_source = source[stream_start:stream_end]
+
+        assert "route, runtime_options, model_name = self._session_chat_runtime_request(body)" in stream_source
+        assert "route=route" in stream_source
+        assert "runtime_options=runtime_options" in stream_source
+        assert "active_run_id=run_id" in stream_source
+        assert '"runtime": self._runtime_ack(route, fallback_model=model_name)' in stream_source
+
+
+class TestRunSteerEndpoint:
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_run_steer(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["features"]["run_steer"] is True
+        assert data["endpoints"]["run_steer"] == {
+            "method": "POST",
+            "path": "/v1/runs/{run_id}/steer",
+        }
+
+    @pytest.mark.asyncio
+    async def test_run_steer_calls_active_agent_and_emits_event(self, adapter):
+        agent = MagicMock()
+        agent.steer.return_value = True
+        queue = asyncio.Queue()
+        adapter._active_run_agents["run_123"] = agent
+        adapter._run_streams["run_123"] = queue
+        adapter._set_run_status("run_123", "running")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_123/steer", json={"text": "tighten the ending"})
+            payload = await resp.json()
+
+        assert resp.status == 200
+        assert payload == {
+            "object": "hermes.run.steer",
+            "run_id": "run_123",
+            "accepted": True,
+        }
+        agent.steer.assert_called_once_with("tighten the ending")
+        status = adapter._run_statuses["run_123"]
+        assert status["last_event"] == "run.steered"
+        event = queue.get_nowait()
+        assert event["event"] == "run.steered"
+        assert event["run_id"] == "run_123"
+        assert event["accepted"] is True
+        assert event["preview"] == "tighten the ending"
+
+    @pytest.mark.asyncio
+    async def test_run_steer_missing_run_returns_structured_404(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_missing/steer", json={"text": "hello"})
+            payload = await resp.json()
+
+        assert resp.status == 404
+        assert payload["error"]["code"] == "run_not_found"
 
 
 # ---------------------------------------------------------------------------

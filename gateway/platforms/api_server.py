@@ -1201,6 +1201,93 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         return self._model_routes.get(model_alias)
 
+    def _runtime_ack(
+        self,
+        route: Optional[Dict[str, Any]],
+        *,
+        fallback_model: Optional[Any] = None,
+        fallback_provider: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Return the effective model/provider envelope safe for API clients."""
+        route = route if isinstance(route, dict) else {}
+        raw_context = route.get("context_length") or route.get("context_tokens")
+        context_length: Optional[int] = None
+        if raw_context is not None:
+            try:
+                context_length = int(raw_context)
+            except (TypeError, ValueError):
+                context_length = None
+        return {
+            "model": route.get("model") or route.get("model_name") or fallback_model,
+            "provider": route.get("provider") or route.get("provider_name") or fallback_provider,
+            "context_length": context_length,
+        }
+
+    @staticmethod
+    def _request_runtime_string(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text or re.search(r'[\r\n\x00]', text):
+            return ""
+        return text
+
+    @staticmethod
+    def _split_provider_model(value: str) -> tuple[str, str]:
+        """Split Browser ids shaped as ``provider:model`` without eating model versions."""
+        if not value or ":" not in value:
+            return "", value
+        provider, model = value.split(":", 1)
+        # Provider slugs are simple (`openrouter`, `openai-codex`, `zenmux`).
+        # Raw provider model IDs can also contain ':' (Bedrock `...:0`), often
+        # with dots/slashes before the colon, so only split simple slug prefixes.
+        if re.match(r"^[a-z0-9][a-z0-9_-]{1,40}$", provider, re.I) and model:
+            return provider, model
+        return "", value
+
+    @staticmethod
+    def _runtime_options_from_request(model_options: Any) -> Dict[str, Any]:
+        if not isinstance(model_options, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        reasoning = model_options.get("reasoning")
+        effort: Any = model_options.get("reasoning_effort")
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                effort = "none"
+            elif reasoning.get("effort") is not None:
+                effort = reasoning.get("effort")
+        elif reasoning is False:
+            effort = "none"
+        if effort is not None:
+            try:
+                from hermes_constants import parse_reasoning_effort
+                parsed = parse_reasoning_effort(effort)
+                if parsed is not None:
+                    out["reasoning_config"] = parsed
+            except Exception:
+                pass
+        service_tier = model_options.get("service_tier")
+        if not service_tier and model_options.get("fast") is True:
+            service_tier = "priority"
+        if service_tier:
+            out["service_tier"] = str(service_tier).strip()
+        return out
+
+    def _session_chat_runtime_request(self, body: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+        """Resolve Browser model/provider/options into one request-scoped runtime route."""
+        model_name = self._request_runtime_string(body.get("model") or body.get("model_id"))
+        provider = self._request_runtime_string(body.get("provider") or body.get("provider_id"))
+        if model_name and not provider:
+            split_provider, split_model = self._split_provider_model(model_name)
+            if split_provider:
+                provider = split_provider
+                model_name = split_model
+        route = self._resolve_route(model_name) if model_name else None
+        if route is None and model_name:
+            route = {"model": model_name}
+            if provider:
+                route["provider"] = provider
+        return route, self._runtime_options_from_request(body.get("model_options")), model_name
+
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
@@ -1232,6 +1319,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        runtime_options: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1264,7 +1352,9 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        reasoning_config = GatewayRunner._load_reasoning_config()
+        runtime_options = runtime_options if isinstance(runtime_options, dict) else {}
+        reasoning_config = runtime_options.get("reasoning_config") or GatewayRunner._load_reasoning_config()
+        service_tier = runtime_options.get("service_tier")
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -1350,6 +1440,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            service_tier=service_tier,
             gateway_session_key=gateway_session_key,
         )
         return agent
@@ -1483,6 +1574,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -1511,6 +1603,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -1885,6 +1978,7 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        route, runtime_options, model_name = self._session_chat_runtime_request(body)
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -1892,6 +1986,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            route=route,
+            runtime_options=runtime_options,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -1904,6 +2000,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
+                "runtime": self._runtime_ack(route, fallback_model=model_name),
             },
             headers=headers,
         )
@@ -1929,12 +2026,20 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        route, runtime_options, model_name = self._session_chat_runtime_request(body)
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
         seq = 0
+        self._set_run_status(
+            run_id,
+            "queued",
+            created_at=time.time(),
+            session_id=session_id,
+            model=model_name,
+        )
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -1973,6 +2078,7 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
+                self._set_run_status(run_id, "running", last_event="run.started")
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
@@ -1982,7 +2088,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    active_run_id=run_id,
                     gateway_session_key=gateway_session_key,
+                    route=route,
+                    runtime_options=runtime_options,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2001,9 +2110,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "completed": True,
                     "messages": turn_messages,
                     "usage": usage,
+                    "runtime": self._runtime_ack(route, fallback_model=model_name),
                 }))
+                self._set_run_status(
+                    run_id,
+                    "completed",
+                    session_id=effective_session_id,
+                    usage=usage,
+                    last_event="run.completed",
+                )
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
+                self._set_run_status(
+                    run_id,
+                    "failed",
+                    error=_redact_api_error_text(exc),
+                    last_event="run.failed",
+                )
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
                 await queue.put(_event_payload("done", {}))
@@ -4020,8 +4143,10 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        active_run_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        runtime_options: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4037,6 +4162,10 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        If *active_run_id* is supplied, the agent is also registered in
+        ``_active_run_agents`` for external control-plane actions such as
+        /v1/runs/{run_id}/steer while the turn is running.
         """
         loop = asyncio.get_running_loop()
 
@@ -4058,9 +4187,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    runtime_options=runtime_options,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
+                if active_run_id:
+                    self._active_run_agents[active_run_id] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
@@ -4080,6 +4212,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                if active_run_id:
+                    self._active_run_agents.pop(active_run_id, None)
                 clear_session_vars(tokens)
 
         self._inflight_agent_runs += 1
@@ -4620,6 +4754,82 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — inject text into an active run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent = self._active_run_agents.get(run_id)
+        status = self._run_statuses.get(run_id)
+        if agent is None:
+            if status is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            return web.json_response(
+                _openai_error(f"Run is not currently steerable: {run_id}", code="run_not_active"),
+                status=409,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        raw_text = body.get("input") or body.get("message") or body.get("text") or ""
+        steer_text = _normalize_chat_content(raw_text).strip()
+        if not steer_text:
+            return web.json_response(
+                _openai_error("Missing steer text; expected 'input', 'message', or 'text'.", code="missing_steer_text"),
+                status=400,
+            )
+
+        if not hasattr(agent, "steer"):
+            return web.json_response(
+                _openai_error(f"Run agent does not support steering: {run_id}", code="run_not_steerable"),
+                status=409,
+            )
+
+        try:
+            accepted = bool(agent.steer(steer_text))
+        except Exception as exc:
+            logger.warning("[api_server] steer failed for run %s: %s", run_id, exc)
+            return web.json_response(_openai_error(str(exc), code="steer_failed"), status=500)
+
+        if not accepted:
+            return web.json_response(
+                _openai_error(f"Run did not accept steer text: {run_id}", code="steer_not_accepted"),
+                status=409,
+            )
+
+        self._set_run_status(
+            run_id,
+            status.get("status", "running") if isinstance(status, dict) else "running",
+            last_event="run.steered",
+        )
+        event = {
+            "event": "run.steered",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "accepted": True,
+            "preview": steer_text[:160],
+        }
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": "hermes.run.steer",
+            "run_id": run_id,
+            "accepted": True,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4797,6 +5007,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
+            self._app.router.add_post("/v1/runs/{run_id}/steer", self._handle_steer_run)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
