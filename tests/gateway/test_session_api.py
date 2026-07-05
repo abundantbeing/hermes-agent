@@ -44,6 +44,8 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
+    app.router.add_get("/api/sessions/{session_id}/context", adapter._handle_session_context)
+    app.router.add_post("/api/sessions/{session_id}/compress", adapter._handle_session_compress)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
@@ -64,6 +66,8 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_context"] is True
+    assert features["session_compress"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -73,6 +77,82 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
     }
+    assert data["endpoints"]["session_context"] == {
+        "method": "GET",
+        "path": "/api/sessions/{session_id}/context",
+    }
+    assert data["endpoints"]["session_compress"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/compress",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_context_reports_live_and_archived_message_counts(adapter, session_db):
+    session_id = session_db.create_session("context-session", "api_server", model="test-model")
+    session_db.append_message(session_id, "user", "first")
+    session_db.append_message(session_id, "assistant", "second")
+    session_db.archive_and_compact(session_id, [{"role": "user", "content": "compact summary"}])
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/context")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload["object"] == "hermes.session.context"
+    assert payload["session_id"] == session_id
+    assert payload["live_message_count"] == 1
+    assert payload["archived_message_count"] == 2
+    assert payload["has_archived_messages"] is True
+    assert payload["runtime"]["model"] == "test-model"
+
+
+@pytest.mark.asyncio
+async def test_session_compress_uses_agent_compressor_and_reports_result(adapter, session_db, monkeypatch):
+    session_id = session_db.create_session("compress-session", "api_server", model="test-model")
+    for role, content in [
+        ("user", "one"),
+        ("assistant", "two"),
+        ("user", "three"),
+        ("assistant", "four"),
+    ]:
+        session_db.append_message(session_id, role, content)
+
+    class FakeAgent:
+        model = "test-model"
+        provider = "fake-provider"
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        def _compress_context(self, messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None, force=False):
+            assert len(messages) == 4
+            assert system_message is None
+            assert focus_topic == "preserve Browser state"
+            assert force is True
+            compacted = [{"role": "user", "content": f"summary: {focus_topic}"}]
+            session_db.archive_and_compact(self.session_id, compacted)
+            return compacted, approx_tokens or 0
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent(kwargs["session_id"]))
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/compress",
+            json={"mode": "force", "focus": "preserve Browser state"},
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload["object"] == "hermes.session.context.compression"
+    assert payload["session_id"] == session_id
+    assert payload["rotated_session_id"] == session_id
+    assert payload["compacted"] is True
+    assert payload["live_message_count"] == 1
+    assert payload["archived_message_count"] == 4
+    assert session_db.get_messages(session_id)[0]["content"] == "summary: preserve Browser state"
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,8 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- GET  /api/sessions/{session_id}/context — inspect live/archived context state
+- POST /api/sessions/{session_id}/compress — compact a session with Hermes' native compressor
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -1582,6 +1584,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_context": True,
+                "session_compress": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -1612,6 +1616,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_context": {"method": "GET", "path": "/api/sessions/{session_id}/context"},
+                "session_compress": {"method": "POST", "path": "/api/sessions/{session_id}/compress"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -1909,6 +1915,162 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
         })
+
+    def _session_context_payload(
+        self,
+        requested_session_id: str,
+        *,
+        runtime: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build a client-safe context accounting envelope for one session."""
+        db = self._ensure_session_db()
+        resolved_id = db.resolve_resume_session_id(requested_session_id)
+        session = db.get_session(resolved_id) or {"id": resolved_id}
+        live_messages = db.get_messages(resolved_id)
+        all_messages = db.get_messages(resolved_id, include_inactive=True)
+        archived_messages = [m for m in all_messages if not bool(m.get("active", 1))]
+        live_conversation = db.get_messages_as_conversation(resolved_id)
+        estimated_prompt_tokens: Optional[int] = None
+        try:
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            estimated_prompt_tokens = estimate_request_tokens_rough(
+                live_conversation,
+                system_prompt=session.get("system_prompt") or "",
+            )
+        except Exception:
+            estimated_prompt_tokens = None
+        runtime = dict(runtime or {})
+        if not runtime.get("model") and session.get("model"):
+            runtime["model"] = session.get("model")
+        return {
+            "object": "hermes.session.context",
+            "requested_session_id": requested_session_id,
+            "session_id": resolved_id,
+            "live_message_count": len(live_messages),
+            "archived_message_count": len(archived_messages),
+            "total_message_count": len(all_messages),
+            "has_archived_messages": bool(archived_messages),
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "last_prompt_tokens": estimated_prompt_tokens,
+            "runtime": runtime,
+        }
+
+    async def _handle_session_context(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/context — live context/compaction state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        try:
+            return web.json_response(self._session_context_payload(session_id))
+        except Exception:
+            logger.exception("GET /api/sessions/%s/context failed", session_id)
+            return web.json_response(
+                _openai_error("Failed to inspect session context", code="session_context_failed"),
+                status=500,
+            )
+
+    async def _handle_session_compress(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/compress — run native Hermes compaction."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        session_id = request.match_info["session_id"]
+        session, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        focus = body.get("focus") or body.get("focus_topic")
+        if focus is not None and not isinstance(focus, str):
+            return web.json_response(_openai_error("focus must be a string", code="invalid_focus"), status=400)
+        db = self._ensure_session_db()
+        resolved_id = db.resolve_resume_session_id(session_id)
+        messages = db.get_messages_as_conversation(resolved_id)
+        if len(messages) < 4:
+            return web.json_response(
+                _openai_error("Not enough conversation to compress (need at least 4 messages)", code="not_enough_context"),
+                status=409,
+            )
+        route, runtime_options, model_name = self._session_chat_runtime_request(body)
+        loop = asyncio.get_running_loop()
+
+        def _compress() -> Dict[str, Any]:
+            from gateway.session_context import clear_session_vars
+
+            tokens = self._bind_api_server_session(
+                chat_id=resolved_id,
+                session_key=gateway_session_key or resolved_id,
+                session_id=resolved_id,
+            )
+            try:
+                agent = self._create_agent(
+                    session_id=resolved_id,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
+                    runtime_options=runtime_options,
+                )
+                approx_tokens = None
+                try:
+                    from agent.model_metadata import estimate_request_tokens_rough
+
+                    approx_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=session.get("system_prompt") or "",
+                    )
+                except Exception:
+                    approx_tokens = None
+                compressed, _ = agent._compress_context(
+                    messages,
+                    None,
+                    approx_tokens=approx_tokens,
+                    task_id=resolved_id,
+                    focus_topic=(focus.strip() if isinstance(focus, str) and focus.strip() else None),
+                    force=True,
+                )
+                effective_session_id = getattr(agent, "session_id", resolved_id) or resolved_id
+                runtime = self._runtime_ack(route, fallback_model=model_name or getattr(agent, "model", session.get("model")))
+                provider = getattr(agent, "provider", None)
+                if provider and not runtime.get("provider"):
+                    runtime["provider"] = provider
+                payload = self._session_context_payload(effective_session_id, runtime=runtime)
+                payload.update({
+                    "object": "hermes.session.context.compression",
+                    "requested_session_id": session_id,
+                    "session_id": resolved_id,
+                    "rotated_session_id": effective_session_id,
+                    "compacted": len(compressed or []) < len(messages) or effective_session_id != resolved_id,
+                    "source_message_count": len(messages),
+                    "summary": (
+                        "Hermes compacted the active session context."
+                        if effective_session_id == resolved_id
+                        else f"Hermes compacted context into continuation session {effective_session_id}."
+                    ),
+                })
+                return payload
+            finally:
+                clear_session_vars(tokens)
+
+        try:
+            payload = await loop.run_in_executor(None, _compress)
+        except Exception as exc:
+            logger.exception("POST /api/sessions/%s/compress failed", session_id)
+            return web.json_response(
+                _openai_error(_redact_api_error_text(exc), code="session_compress_failed"),
+                status=500,
+            )
+        headers = {"X-Hermes-Session-Id": payload.get("rotated_session_id") or resolved_id}
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response(payload, headers=headers)
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
@@ -4981,6 +5143,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
+            self._app.router.add_get("/api/sessions/{session_id}/context", self._handle_session_context)
+            self._app.router.add_post("/api/sessions/{session_id}/compress", self._handle_session_compress)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
