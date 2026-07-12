@@ -900,6 +900,32 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+def _resolve_profile_scope(profile: str | None) -> tuple[Path | None, bool]:
+    """Resolve an explicitly requested profile to ``(home_override, resolved)``.
+
+    ``home_override`` is None both for the launch profile and for a name that
+    does not resolve on this host; ``resolved`` distinguishes them so session
+    RPCs can REJECT an unresolved explicit profile instead of silently scoping
+    the session to the launch profile (clients that verify profile scope, such
+    as the browser extension, rely on that rejection).
+    """
+    name = (profile or "").strip()
+    if not name:
+        return None, True
+    home = _profile_home(name)
+    if home is not None:
+        return home, True
+    # ``home`` is None both when the name IS the launch profile and when it
+    # does not resolve; only the former is a valid explicit request.
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        is_launch = Path(profiles_mod.get_profile_dir(name)).resolve() == Path(_hermes_home).resolve()
+    except Exception:
+        return None, False
+    return None, is_launch
+
+
 def _profile_scoped(handler):
     """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
 
@@ -3045,6 +3071,15 @@ def _current_profile_name() -> str:
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
 DESKTOP_BACKEND_CONTRACT = 2
 
+# Capabilities advertised on the gateway.ready event (both the WS accept and
+# the stdio startup emit them). Clients gate optional request surfaces on
+# these flags BEFORE sending the RPC: the browser extension refuses to send a
+# profile-scoped session.create/session.resume unless ``session_profiles`` is
+# advertised, because a gateway without this build would silently create the
+# session in the launch scope. Legacy gateways advertise nothing, which
+# clients must treat as "unsupported".
+GATEWAY_CAPABILITIES = {"session_profiles": True}
+
 
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
@@ -4863,8 +4898,13 @@ def _(rid, params: dict) -> dict:
     # profile must build its agent + persist against THAT profile's home/state.db,
     # not the dashboard's launch profile. Stored on the session so _start_agent_build
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
+    # An explicit profile that does not resolve is REJECTED rather than being
+    # silently scoped to the launch profile: the name may have been deleted or
+    # renamed between the client's discovery and this request.
     profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
+    profile_home, profile_resolved = _resolve_profile_scope(profile)
+    if profile and not profile_resolved:
+        return _err(rid, 4041, f"profile not found: {profile}")
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -4950,6 +4990,10 @@ def _(rid, params: dict) -> dict:
         {
             "session_id": sid,
             "stored_session_id": key,
+            # Authoritative effective scope for this session ("" = launch
+            # profile). Clients that requested an explicit profile compare
+            # this echo against their request before trusting the session.
+            "profile": profile or "",
             "message_count": len(history),
             "messages": _history_to_messages(history),
             "info": {
@@ -5217,6 +5261,22 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    # ``profile`` (app-global remote mode): resume a session that lives in another
+    # local profile's state.db. None/own profile → the launch profile (unchanged).
+    # An explicit profile that does not resolve is REJECTED (see session.create),
+    # and the validated effective scope is echoed on every success payload so
+    # clients can verify the session landed where they asked.
+    profile = (params.get("profile") or "").strip() or None
+    profile_home, profile_resolved = _resolve_profile_scope(profile)
+    if profile and not profile_resolved:
+        return _err(rid, 4041, f"profile not found: {profile}")
+    response = _session_resume(rid, params, profile_home)
+    if isinstance(response, dict) and isinstance(response.get("result"), dict):
+        response["result"]["profile"] = profile or ""
+    return response
+
+
+def _session_resume(rid, params: dict, profile_home: Path | None) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -5224,10 +5284,6 @@ def _(rid, params: dict) -> dict:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
-    # ``profile`` (app-global remote mode): resume a session that lives in another
-    # local profile's state.db. None/own profile → the launch profile (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
 
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
     # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
