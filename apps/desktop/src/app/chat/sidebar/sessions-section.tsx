@@ -420,7 +420,7 @@ export function SidebarSessionsSection({
         onEnter={onEnterProject}
         onNewSession={onNewSessionInWorkspace}
         onNewSessionSplit={onNewSessionSplit}
-        previewSessions={project.path ? projectOverviewPreviews?.[project.path] : undefined}
+        previewSessions={projectOverviewPreviews?.[project.id]}
         project={project}
         renderRows={renderRows}
       />
