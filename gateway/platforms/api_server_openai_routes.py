@@ -766,15 +766,24 @@ class OpenAICompatRoutesMixin:
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
 
-            # tool_progress_callback deliberately NOT wired: it would duplicate the structured
-            # start/complete callbacks (which carry the tool_call id).
-            # The completion id doubles as the run id; on_done drops the approval mapping once the
-            # turn ends (POST /v1/runs/{id}/approval then answers 409) and sets the terminal status.
+            def _on_subagent_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                # Structured start/complete callbacks already cover tool ids. Only the
+                # dock events ride this callback, so they are not a second tool frame.
+                from gateway.platforms.api_server_runs import public_subagent_sse_payload
+                from agent.redact import redact_sensitive_text
+                payload = public_subagent_sse_payload(
+                    event_type, tool_name, preview, kwargs, redact_sensitive_text)
+                if payload is not None:
+                    _stream_q.put_threadsafe(("__subagent__", (event_type, payload)))
+
+            # tool_progress_callback is subagent-only here: wiring the structured
+            # tool start/complete events through it would duplicate hermes.tool.progress.
             approval_notify, end_stream_run = self._register_stream_approval(
                 request, completion_id, _stream_q, session_id)
             agent_task, agent_ref = self._spawn_stream_agent(
                 _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
+                tool_complete_callback=_on_tool_complete, tool_progress_callback=_on_subagent_progress,
+                approval_notify_callback=approval_notify,
                 approval_session_key=completion_id, **run_kwargs)
             # #13437 identity contract: an explicit-header client keeps addressing the id it
             # sent; the response echoes that stable id while reads/writes adopt the live tip,
@@ -908,6 +917,9 @@ class OpenAICompatRoutesMixin:
                     if not self._tool_progress_events:
                         continue  # opted out for strict OpenAI clients (#12020)
                     await response.write(_sse_frame(delta[1], event="hermes.tool.progress"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__subagent__":
+                    event_type, payload = delta[1]
+                    await response.write(_sse_frame(payload, event=event_type))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__reasoning__":
                     # DeepSeek-style ``delta.reasoning_content`` (#99552), the field Open WebUI,
                     # opencode and the Vercel AI SDK render as a thinking block.

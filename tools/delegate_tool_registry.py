@@ -89,6 +89,37 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
             return None
         return pending if isinstance(pending, str) and pending.strip() else None
 
+def subagent_belongs_to_agent_session(subagent_id: str, session_id: str) -> bool:
+    """True when this live child was commissioned by the durable agent session."""
+    wanted = str(session_id or "").strip()
+    if not wanted or not subagent_id:
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+    if not record:
+        return False
+    owner = str(record.get("owner_agent_session_id") or "").strip()
+    if owner == wanted:
+        return True
+    agent = record.get("agent")
+    parent_ref = getattr(agent, "_delegate_parent_ref", None)
+    parent = parent_ref() if callable(parent_ref) else None
+    return str(getattr(parent, "session_id", "") or "").strip() == wanted
+
+
+def list_subagents_for_agent_session(session_id: str) -> List[Dict[str, Any]]:
+    wanted = str(session_id or "").strip()
+    if not wanted:
+        return []
+    with _active_subagents_lock:
+        ids = [
+            sid for sid, record in _active_subagents.items()
+            if str(record.get("owner_agent_session_id") or "").strip() == wanted
+        ]
+    public = {row.get("subagent_id"): row for row in list_active_subagents()}
+    return [public[sid] for sid in ids if sid in public]
+
+
 def interrupt_subagent(subagent_id: str) -> bool:
     """Request that one running subagent stop at its next iteration boundary
     (cooperative: the flag propagates to in-flight tools and recurses into
@@ -155,6 +186,18 @@ def steer_subagent(
         except Exception as exc:
             logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
             return False
+
+def steer_subagent_for_agent_session(subagent_id: str, session_id: str, text: str) -> bool:
+    if not subagent_belongs_to_agent_session(subagent_id, session_id):
+        return False
+    return steer_subagent(subagent_id, text)
+
+
+def interrupt_subagent_for_agent_session(subagent_id: str, session_id: str) -> bool:
+    if not subagent_belongs_to_agent_session(subagent_id, session_id):
+        return False
+    return interrupt_subagent(subagent_id)
+
 
 def _capture_gateway_steer_authority(owner_session_id: Optional[str]) -> tuple[Any, Any]:
     """Exact request transport + live session generation, if any — an in-process

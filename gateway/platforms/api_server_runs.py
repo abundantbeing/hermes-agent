@@ -83,6 +83,16 @@ _SUBAGENT_EVENT_KEYS = (
     "output_tokens", "reasoning_tokens", "api_calls", "cost_usd", "files_read", "files_written",
     "output_tail")
 _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
+# Browser dock events. The runs stream still forwards only start/complete;
+# session chat and chat-completions need the working events too.
+_BROWSER_SUBAGENT_EVENTS = frozenset({
+    "subagent.spawn_requested",
+    "subagent.start",
+    "subagent.thinking",
+    "subagent.tool",
+    "subagent.progress",
+    "subagent.complete",
+})
 # Terminal usage payload: (wire key, agent attribute), in wire order. Cache reads ride along so a
 # cost poller does not book them as full-price input (#102101).
 _USAGE_FIELDS = (
@@ -96,6 +106,31 @@ _FIXED_EVENT_FIELDS = {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
 _TOOL_COMPLETED_PREVIEW_MAX_CHARS = 500
+
+
+def public_subagent_sse_payload(event_type, tool_name, preview, kwargs, redact_sensitive_text):
+    """Allowlisted subagent frame for a public SSE stream. None when it is not a dock event."""
+    if event_type not in _BROWSER_SUBAGENT_EVENTS:
+        return None
+    fields = kwargs if isinstance(kwargs, dict) else {}
+    payload = {}
+    if tool_name:
+        payload["tool_name"] = str(tool_name)
+    if preview is not None:
+        text = redact_sensitive_text(str(preview), force=True)
+        payload["preview"] = text
+        payload["text"] = text
+        if event_type == "subagent.tool":
+            payload["tool_preview"] = text
+    for key in _SUBAGENT_EVENT_KEYS:
+        value = fields.get(key)
+        if value is None:
+            continue
+        redact = key in _SUBAGENT_TEXT_KEYS and isinstance(value, str)
+        payload[key] = redact_sensitive_text(value, force=True) if redact else value
+    if not payload.get("subagent_id") and not payload.get("goal"):
+        return None
+    return payload
 
 
 def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., str]) -> str:

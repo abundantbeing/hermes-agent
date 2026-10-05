@@ -1770,6 +1770,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("GET", "/api/sessions/{session_id}/subagents", self._handle_session_subagents),
+            ("POST", "/api/sessions/{session_id}/subagents/{subagent_id}/steer", self._handle_session_subagent_steer),
+            ("POST", "/api/sessions/{session_id}/subagents/{subagent_id}/interrupt", self._handle_session_subagent_interrupt),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3679,6 +3682,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     else event_type
                 )
                 events.enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+            else:
+                from gateway.platforms.api_server_runs import public_subagent_sse_payload
+                subagent_payload = public_subagent_sse_payload(
+                    event_type, tool_name, preview, kwargs, redact_sensitive_text)
+                if subagent_payload is not None:
+                    events.enqueue(event_type, subagent_payload)
 
         def _commentary(text: str, *, already_streamed: bool = False) -> None:
             # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls)
@@ -3824,6 +3833,51 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             model_lock="accepted")
         return web.json_response(
             {"object": "hermes.session.model_lock", "session_id": session_id, "runtime": runtime})
+
+    @_require_auth
+    async def _handle_session_subagents(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/subagents — live children of this session."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        from tools.delegate_tool_registry import list_subagents_for_agent_session
+        return web.json_response({"subagents": list_subagents_for_agent_session(session_id)})
+
+    @_require_auth
+    async def _handle_session_subagent_steer(self, request: "web.Request") -> "web.Response":
+        """POST steer text into a live child owned by this session."""
+        session_id = request.match_info["session_id"]
+        subagent_id = request.match_info["subagent_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        text = str((body or {}).get("text") or "").strip()
+        if not text:
+            return _error_response("text is required", 400, code="text_required")
+        from tools.delegate_tool_registry import steer_subagent_for_agent_session
+        queued = steer_subagent_for_agent_session(subagent_id, session_id, text)
+        return web.json_response({
+            "status": "queued" if queued else "rejected",
+            "subagent_id": subagent_id,
+        })
+
+    @_require_auth
+    async def _handle_session_subagent_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST stop one live child owned by this session."""
+        session_id = request.match_info["session_id"]
+        subagent_id = request.match_info["subagent_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        from tools.delegate_tool_registry import interrupt_subagent_for_agent_session
+        found = interrupt_subagent_for_agent_session(subagent_id, session_id)
+        if not found:
+            return _error_response("Subagent is no longer running.", 404, code="subagent_not_found")
+        return web.json_response({"found": True, "subagent_id": subagent_id})
 
     # -- Cron jobs API ----------------------------------------------------------------
 
